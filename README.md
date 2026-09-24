@@ -16,7 +16,7 @@ key 用设备的 `prjname`（取自 `ro.boot.prjname` / 内核 cmdline 的 `oplu
 mkdir twrp && cd twrp
 repo init --depth=1 -u https://github.com/TWRP-Test/platform_manifest_twrp_aosp.git -b twrp-16.0
 repo sync
-git clone --depth=1 <this repo> device/oplus/sm88xx
+git clone --depth=1 -b twrp-16.0 https://github.com/lmhx-dev/twrp_device_oplus_sm88xx device/oplus/sm88xx
 ```
 
 ```shell
