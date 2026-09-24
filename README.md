@@ -118,12 +118,6 @@ lafa 沿用默认的 `twrp.se.no_sb=false`（该机确实带 strongbox HAL）。
 {"ro.color597.product_name",   info.model},   // TWRP MTP reads this for the model name
 ```
 
-`vendor_load_properties()` 末尾新增了一条覆盖（见注意事项 8）：
-
-```cpp
-OverrideProperty("ro.virtual_ab.userspace.snapshots.enabled", "false");
-```
-
 ## 4. `recovery/root/init.recovery.qcom.rc`
 
 - `post_boot-sun_default_6_2.sh` → `post_boot-canoe_default_6_2.sh`
@@ -326,13 +320,18 @@ MTP 用到，覆盖它语义上不规范，因此未做处理。若确实需要�
 `TwrpMtpServer.cpp` 的两行改用标准的 `ro.product.manufacturer` / `ro.product.model`
 （后者语义最正确，但改动在 TWRP 源码里，重新 `repo sync` 会被覆盖）。
 
-## 注意事项 8 —— 刷官方全量包报「错误 7」
+## 注意事项 8 —— 刷官方全量包报「错误 7 / 60」（未解决）
 
 刷 `RMX5200_16.0.10.501` 这类官方全量包时，TWRP 报：
 
 ```
 Error applying update: 7 (ErrorCode::kInstallDeviceOpenError)
 ```
+
+后续尝试中还会变成错误 60，见下文「错误 60 —— 真正的阻塞点」。
+
+**状态：未解决，本树当前不做任何相关改动。** 下面记录完整的排查过程和两个阻塞点，
+以便日后回来处理。
 
 完整错误链（`update_engine_sideload`）：
 
@@ -389,38 +388,95 @@ if (!using_snapuserd) {
 快照准备失败后走「原地覆盖分区」兜底，又因为 `system_b` 在 super 里已存在而失败
 （`AddPartition` 遇到重名直接返回 nullptr），最终 `kInstallDeviceOpenError` = 错误 7。
 
-### 修法
+### 尝试过的修法（已还原）
 
-在 `libinit` 的 `vendor_load_properties()` 末尾把属性覆盖掉：
+一度在 `libinit` 的 `vendor_load_properties()` 末尾覆盖掉这个属性：
 
 ```cpp
 OverrideProperty("ro.virtual_ab.userspace.snapshots.enabled", "false");
 ```
 
-这样 `userspace_snapshots_requested` 为假，保护不触发，正常走 dm-snapshot。
+这样 `userspace_snapshots_requested` 为假，保护不触发。**错误 7 确实消失了**，
+update_engine 开始真正创建快照 —— 但立刻撞上第二个阻塞点，报错误 60。
 
-**为什么放在 libinit 而不是 `.prop` 文件**：`ro.` 属性是**首次定义生效**，而
-`prop.default` 是把 system / vendor / odm / product / system_ext 的 build.prop
-依次 `cat` 拼起来的（`build/make/core/Makefile:2724-2728`）。`compression.mk` 用
-`PRODUCT_VENDOR_PROPERTIES` 写入 `/vendor/build.prop`，排在前面，后加的定义赢不了。
-`OverrideProperty` 走 `__system_property_update` 绕过只读检查，必定生效。
+该改动**已还原**，本树当前不做任何 VABC 相关覆盖。
 
-### 代价
+**（当时的理由，留作参考）** 为什么放在 libinit 而不是 `.prop` 文件：`ro.` 属性是
+**首次定义生效**，而 `prop.default` 是把 system / vendor / odm / product / system_ext
+的 build.prop 依次 `cat` 拼起来的（`build/make/core/Makefile:2724-2728`）。
+`compression.mk` 用 `PRODUCT_VENDOR_PROPERTIES` 写入 `/vendor/build.prop`，排在前面，
+后加的定义赢不了。`OverrideProperty` 走 `__system_property_update` 绕过只读检查，必定生效。
 
-recovery 里**所有** OTA 都按非 VABC 处理。如果将来有 OTA 确实要用 VABC
-（压缩快照），会退化成非压缩 —— 能刷，只是慢一些。
+### 错误 60 —— 真正的阻塞点
 
-更彻底的做法是改 TWRP 源码，让 payload 明确禁用 VABC 时允许回退：
+覆盖属性之后，失败点前移到：
+
+```
+Error applying update: 60 (ErrorCode::kNotEnoughSpace)
+```
+
+`kNotEnoughSpace` 在这里**不是真的没空间**（/data 有 199 GB 可用）：
+
+**1. super 的 COW 空间不够。** 全量包需要 `Calculated needed COW space: 6706819072 bytes`
+（6.7 GB），而 super 只有约 4.33 GB 可分配：
+
+```
+my_product_b:  cow partition size = 1785847808
+my_region_b:   cow partition size = 7090176
+my_stock_b:    cow partition size = 4329693184
+               Remaining free space for COW: 0 bytes      ← super 的 COW 空间耗尽
+odm_b / system_b / vendor_b / ...: cow partition size = 0 ← 只能落 /data
+```
+
+**2. recovery 下禁止 /data 承载 COW**（`system/core/fs_mgr/libsnapshot/snapshot.cpp:515`）：
 
 ```cpp
-if (!using_snapuserd) {
-    if (userspace_snapshots_requested && vabc_disable_reason.empty()) {
-        LOG(ERROR) << "...";
-        return Return::Error();
-    }
-    LOG(INFO) << "Using legacy Virtual A/B (dm-snapshot)";
+if (device_->IsRecovery()) {
+    LOG(ERROR) << "Cannot create /data backed snapshots in recovery.";
+    return Return::NoSpace(status.cow_file_size());   // 伪装成"空间不足"
 }
 ```
 
-语义上更正确（只影响这一种情况），但改动在 `system/core/fs_mgr/libsnapshot/`，
+所以快照路径必然失败。
+
+**3. 「原地覆盖分区」兜底也失败。** `NewForUpdate` 里因为 payload 的
+`snapshot_enabled=1`，走 `UpdateMetadataForInPlaceSnapshot`，它把 `system_a`
+**原地改名**成 `system_b`，但**仍留在原来的组**：
+
+```cpp
+partition.group_index = std::distance(new_group_ptrs.begin(), it);   // 组索引不变
+```
+
+而 `DeleteGroupsWithSuffix(builder, "_b")` 只删**组名**以 `_b` 结尾的组，清理不掉
+这些改名后的分区，于是 `AddPartition("system_b")` 撞重名返回 nullptr。
+
+### 顺带发现：super 元数据布局与 payload 期望不符
+
+直接解析 liblp 元数据（三个槽完全一致）：
+
+```
+组:
+  [0] default                      max_size=0
+  [1] qti_dynamic_partitions_b     max_size=18903728128   ← 空的孤儿组
+  [2] cow                          max_size=0
+
+分区: 17 个全是 *_a，全部属于 default 组
+```
+
+而 **payload 期望的组名是 `qti_dynamic_partitions`**。正常 oplus/QCOM 布局分区应在
+`qti_dynamic_partitions` 组里，不是 `default`。这个 `default` + 空
+`qti_dynamic_partitions_b` 的组合，像是某次更新中途失败留下的残留状态。
+
+### 结论：TWRP 这条路径走不通
+
+快照路径受 /data 限制，覆盖路径受组名不匹配限制，两条都断。建议绕开 update_engine：
+
+- **fastboot 刷镜像** —— 从 `payload.bin` 解出各分区镜像，直接刷到非活动槽
+  （`fastboot flash system_b system.img` … 再 `--set-active=b`），完全绕过快照机制
+- **系统自带更新通道** —— 回到 Android 用「设置 → 系统更新 → 本地安装」，或
+  `adb sideload`。Android 模式下 `IsRecovery()` 为假，/data 承载快照是允许的
+
+若一定要在 TWRP 里刷，需要改 TWRP 源码两处：让 payload 明确禁用 VABC 时允许回退
+（`snapshot.cpp`），以及让 `UpdatePartitionMetadata` 按分区名而非组名清理
+（`dynamic_partition_control_android.cc`）。改动都在 TWRP 源码里，
 重新 `repo sync` 会被覆盖。
