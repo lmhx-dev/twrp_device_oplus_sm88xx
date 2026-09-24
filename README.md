@@ -36,13 +36,16 @@ Works:
 - [X] Display
 - [X] Decryption
 - [X] Fastbootd
-- [X] Flashing
 - [X] MTP
 - [X] Sideload
 - [X] Touch
 - [X] USB OTG
 - [X] Vibrator
 
+ Not Works:
+ 
+- [X] Flashing Firaware Rom
+      
 ## To use it:
 
 ```shell
