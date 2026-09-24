@@ -118,6 +118,12 @@ lafa 沿用默认的 `twrp.se.no_sb=false`（该机确实带 strongbox HAL）。
 {"ro.color597.product_name",   info.model},   // TWRP MTP reads this for the model name
 ```
 
+`vendor_load_properties()` 末尾新增了一条覆盖（见注意事项 8）：
+
+```cpp
+OverrideProperty("ro.virtual_ab.userspace.snapshots.enabled", "false");
+```
+
 ## 4. `recovery/root/init.recovery.qcom.rc`
 
 - `post_boot-sun_default_6_2.sh` → `post_boot-canoe_default_6_2.sh`
@@ -319,3 +325,102 @@ MTP 用到，覆盖它语义上不规范，因此未做处理。若确实需要�
 有两种做法：在 `props[]` 里一并覆盖 `ro.build.product`，或把
 `TwrpMtpServer.cpp` 的两行改用标准的 `ro.product.manufacturer` / `ro.product.model`
 （后者语义最正确，但改动在 TWRP 源码里，重新 `repo sync` 会被覆盖）。
+
+## 注意事项 8 —— 刷官方全量包报「错误 7」
+
+刷 `RMX5200_16.0.10.501` 这类官方全量包时，TWRP 报：
+
+```
+Error applying update: 7 (ErrorCode::kInstallDeviceOpenError)
+```
+
+完整错误链（`update_engine_sideload`）：
+
+```
+Loaded metadata from slot A in /dev/block/bootdevice/by-name/super
+Userspace snapshots disabled: not enabled metadata
+Compression disabled: not enabled metadata
+Userspace snapshots were requested, refusing to fall back to legacy Virtual A/B (dm-snapshot)
+Cannot create update snapshots: Error
+PrepareSnapshotPartitionsForUpdate failed in recovery. Attempt to overwrite existing partitions if possible
+Not using snapshot on VAB device because sideloading.
+Added group qti_dynamic_partitions_b with size 18903728128
+[liblp] Attempting to create duplication partition with name: system_b
+Cannot add partition system_b to group qti_dynamic_partitions_b
+UpdatePartitionMetadata(builder.get(), target_slot, manifest) failed.
+```
+
+### 根因
+
+把 OTA 的 `payload.bin` 头部解出来（payload 是 Stored 未压缩的，读 zip 开头 512KB 即可），
+`DeltaArchiveManifest.dynamic_partition_metadata`（字段 15）的原始字节是：
+
+```
+10 01             snapshot_enabled = 1
+18 00             vabc_enabled     = 0     ← 关键
+22 00             vabc_compression_param = ""
+28 02             cow_version      = 2
+38 80 80 20       compression_factor = 4096
+```
+
+**payload 明确设了 `vabc_enabled = 0`** —— 即这个全量包要求走**非压缩**的 Virtual A/B
+（legacy dm-snapshot）。proto 注释写得很清楚：
+
+> If this is set to false, update_engine should not use VABC **regardless**.
+
+但设备侧 `ro.virtual_ab.userspace.snapshots.enabled = true`
+（来自 `build/make/target/product/virtual_ab_ota/compression.mk:20`，本树 `device.mk`
+继承了 `compression_with_xor.mk`），于是 TWRP 给 `snapshot.cpp` 加的保护触发：
+
+```cpp
+// TWRP keeps the legacy dm-snapshot backend for products that do not opt in
+// to userspace snapshots, but an opted-in product must never silently create
+// state that a newer first-stage init cannot consume.
+const bool userspace_snapshots_requested = GetUserspaceSnapshotsEnabledProperty();
+...
+if (!using_snapuserd) {
+    if (userspace_snapshots_requested) {
+        LOG(ERROR) << "Userspace snapshots were requested, refusing to fall back ...";
+        return Return::Error();
+    }
+```
+
+这段保护没有考虑「OTA 自己主动禁用 VABC」的情况，把合法的 dm-snapshot 回退也挡掉了。
+快照准备失败后走「原地覆盖分区」兜底，又因为 `system_b` 在 super 里已存在而失败
+（`AddPartition` 遇到重名直接返回 nullptr），最终 `kInstallDeviceOpenError` = 错误 7。
+
+### 修法
+
+在 `libinit` 的 `vendor_load_properties()` 末尾把属性覆盖掉：
+
+```cpp
+OverrideProperty("ro.virtual_ab.userspace.snapshots.enabled", "false");
+```
+
+这样 `userspace_snapshots_requested` 为假，保护不触发，正常走 dm-snapshot。
+
+**为什么放在 libinit 而不是 `.prop` 文件**：`ro.` 属性是**首次定义生效**，而
+`prop.default` 是把 system / vendor / odm / product / system_ext 的 build.prop
+依次 `cat` 拼起来的（`build/make/core/Makefile:2724-2728`）。`compression.mk` 用
+`PRODUCT_VENDOR_PROPERTIES` 写入 `/vendor/build.prop`，排在前面，后加的定义赢不了。
+`OverrideProperty` 走 `__system_property_update` 绕过只读检查，必定生效。
+
+### 代价
+
+recovery 里**所有** OTA 都按非 VABC 处理。如果将来有 OTA 确实要用 VABC
+（压缩快照），会退化成非压缩 —— 能刷，只是慢一些。
+
+更彻底的做法是改 TWRP 源码，让 payload 明确禁用 VABC 时允许回退：
+
+```cpp
+if (!using_snapuserd) {
+    if (userspace_snapshots_requested && vabc_disable_reason.empty()) {
+        LOG(ERROR) << "...";
+        return Return::Error();
+    }
+    LOG(INFO) << "Using legacy Virtual A/B (dm-snapshot)";
+}
+```
+
+语义上更正确（只影响这一种情况），但改动在 `system/core/fs_mgr/libsnapshot/`，
+重新 `repo sync` 会被覆盖。

@@ -126,4 +126,28 @@ void vendor_load_properties() {
         default:
             OverrideProperty("twrp.se.no_sb", "false");
     }
+
+    // Recovery must not advertise userspace snapshots.
+    //
+    // Official oplus full OTAs ship "vabc_enabled = 0" in their payload
+    // manifest, i.e. they explicitly ask for uncompressed Virtual A/B
+    // (legacy dm-snapshot). The proto says that flag wins: "If this is set to
+    // false, update_engine should not use VABC regardless". But
+    // build/make/target/product/virtual_ab_ota/compression.mk (pulled in via
+    // device.mk) sets ro.virtual_ab.userspace.snapshots.enabled=true, and
+    // TWRP's patched libsnapshot then refuses the fallback:
+    //
+    //   Userspace snapshots were requested, refusing to fall back to legacy
+    //   Virtual A/B (dm-snapshot)
+    //
+    // Snapshot preparation fails, update_engine falls back to overwriting
+    // partitions in place, and dies on a partition that already exists in
+    // super (system_b) with kInstallDeviceOpenError -- TWRP "error 7".
+    //
+    // Overriding the prop here (rather than in a .prop file) is deliberate:
+    // "ro." properties are first-definition-wins, and prop.default is built by
+    // concatenating system/vendor/odm/product/system_ext build.prop files, so
+    // a later file cannot reliably win. OverrideProperty bypasses the read-only
+    // check via __system_property_update and always takes effect.
+    OverrideProperty("ro.virtual_ab.userspace.snapshots.enabled", "false");
 }
